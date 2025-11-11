@@ -15,7 +15,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, CLIPImageProcessor, get_scheduler
 import wandb
 from peft import LoraConfig, get_peft_model
-from data import PedestrianMatchingDataset, PedestrianMatchingDataset_Test
+from data import DocVQADataset,DocVQADataset_test, PedestrianMatchingDataset, PedestrianMatchingDataset_Test
 
 from multilabel_metrics import AveragePrecisionMeter
 from sklearn.metrics.pairwise import cosine_similarity
@@ -24,82 +24,77 @@ import sys, re
 
 import re
 
-def extract_options(text):
+
+def normalize_answer(answer: str) -> str:
     """
-    从模型输出中提取所有候选选项字母 (A-E 或 1-5)，返回一个集合。
-    例如 "Image A and Image B" → {"a", "b"}
+    标准化答案，提取核心关键词并统一格式
     """
-    if not isinstance(text, str):
-        return set()
-    text = text.lower().strip()
+    # 转小写并去除首尾空格
+    answer = answer.strip().lower()
 
-    letters = set(re.findall(r'\b([a-e])\b', text))
-    nums = set(re.findall(r'\b([1-5])\b', text))
+    # 移除标点符号
+    answer = re.sub(r'[^\w\s]', '', answer)
 
-    # 映射数字为字母
-    num_to_letter = {'1': 'a', '2': 'b', '3': 'c', '4': 'd', '5': 'e'}
-    letters.update([num_to_letter[n] for n in nums])
+    # 提取最可能的关键词：寻找 yes / no / possibly / possible / maybe / probably 等
+    if re.search(r'\byes\b', answer):
+        return "Yes."
+    elif re.search(r'\bno\b', answer):
+        return "No."
+    elif re.search(r'\b(possibly|possible|maybe|perhaps|probably)\b', answer):
+        return "Possibly."
+    else:
+        return "Unknown"
 
-    return letters
 
-
-def match_answer_multi(pred, gt):
+def is_answer_correct(generated_answer):
     """
-    判断预测是否包含正确答案：
-    - pred: 模型输出文本
-    - gt: ground truth（如 'Image B' 或 'B'）
+    判断生成的回答是否与预期答案相匹配。
+
+    :param generated_answer: str, 生成的回答
+    :param expected_answer: str, 预期答案
+    :return: bool, 如果匹配成功返回True，否则返回False
     """
-    pred_set = extract_options(pred)
-    gt_letter = extract_options(gt)
 
-    if not gt_letter:
-        return False  # ground truth格式异常
+    expected_answer = 'image 2'
+    # 清理生成的回答和预期答案：转换为小写，移除首尾空格
+    cleaned_generated = generated_answer.strip().lower()
+    cleaned_expected = expected_answer.strip().lower()
 
-    gt_letter = list(gt_letter)[0]  # 只取第一个正确答案
-    return gt_letter in pred_set
+    if cleaned_generated == cleaned_expected:
+        return 'image 2'
+    else:
+        return 'image 1'
+
 
 def evaluate_model(model, val_loaders, image_processor, tokenizer,device, epoch, args, rank):
     model.eval()
 
-    options = [
-        "Image A",
-        "Image B",
-        "Image C",
-        "Image D",
-        "Image E",
-    ]
+
 
     cls_nums_all = 0
     cls_acc_all = 0
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
+
     for batch in tqdm(val_loaders, desc=f"[Rank {rank}] Epoch {epoch + 1}/{args.epochs}"):
-        pixel_values = batch['pixel_values'].to(device, dtype=torch.bfloat16)
-        input_ids = batch['input_ids'].to(device)
-        image_flags = batch['image_flags'].to(device)
 
-        attention_mask = batch['attention_mask'].to(device)
+        messages = batch['messages']
+
+        answers = batch['answers'][0]
 
 
-        full_answer = model.module.generates(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            image_flags=image_flags,
-            tokenizer = tokenizer,
-            max_new_tokens = 1024,
-            do_sample = True,
-            temperature = 0.6
-        )[0]
-        batch_answers = batch['answer'][0]
+        res = model.module.chat(messages[0], tokenizer, image_processor, max_new_tokens=1024, do_sample=True, temperature=0.6)
 
-        is_match = match_answer_multi(full_answer, batch_answers)
 
-        if is_match:
+        is_match = is_answer_correct(res)
+
+        if is_match == answers:
             cls_acc_all += 1
 
         cls_nums_all += 1
+
+
 
     return cls_acc_all / cls_nums_all
 
@@ -162,48 +157,12 @@ def collate_fn(batch, processor, tokenizer, device):
 
 
 def collate_test(batch):
-    """自定义collate函数"""
-    # 找到最长序列长度
-    max_len = max([x['input_ids'].shape[0] for x in batch])
-
-    # Padding
-    input_ids_list = []
-    image_flags_list = []
-    attention_mask_list = []
-
-    for x in batch:
-        seq_len = x['input_ids'].shape[0]
-        pad_len = max_len - seq_len
-
-        # Pad input_ids
-        input_ids = torch.cat([
-            x['input_ids'],
-            torch.zeros(pad_len, dtype=torch.long)
-        ])
-        input_ids_list.append(input_ids)
-
-        # Pad image_flags
-        image_flags = torch.cat([
-            x['image_flags'],
-            torch.zeros(pad_len, dtype=torch.long)
-        ])
-        image_flags_list.append(image_flags)
-
-        attention_mask = torch.cat([
-            torch.ones(seq_len, dtype=torch.long),
-            torch.zeros(pad_len, dtype=torch.long)
-        ])
-        attention_mask_list.append(attention_mask)
+    messages = [item['message'] for item in batch]
+    answers = [item['answers'] for item in batch]
 
     return {
-        'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
-        'input_ids': torch.stack(input_ids_list),
-        'attention_mask': torch.stack(attention_mask_list),
-        'image_flags': torch.stack(image_flags_list),
-        # 'labels': torch.stack(labels_list),
-        'answer': [x['answer'] for x in batch],
-        'caption': [x['caption'] for x in batch],
-        'real_image_idx': [x['real_image_idx'] for x in batch]
+        'messages': messages,
+        'answers': answers
     }
 
 
@@ -243,33 +202,12 @@ def train_model(rank, world_size, args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     processor = CLIPImageProcessor.from_pretrained(args.model_path, trust_remote_code=True)
 
-    # 加载数据集
-    if args.dataset == "DGM4":
-        with open(args.train_json, "r") as f:
-            train_data = json.load(f)
-        with open(args.val_json, "r") as f:
-            val_data = json.load(f)
-        train_dataset = PedestrianMatchingDataset( data=train_data, image_processor=processor, tokenizer=tokenizer)
-        # val_datasets = {"DGM4": OriDGM4Dataset(split='validation', data=val_data, image_processor=processor, tokenizer=tokenizer)}
-        val_datasets = PedestrianMatchingDataset_Test(data=val_data, image_processor=processor, tokenizer=tokenizer)
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
-
-
-    if args.use_lora:
-        TARGET_MODULES = ["q_proj", "o_proj", "k_proj", "v_proj", "linear", "Conv2d", "lm_head", "fc2"]
-
-        if rank == 0:
-            print(f"[Rank {rank}] Applying LoRA with target modules: {TARGET_MODULES}")
-        config = LoraConfig(
-            r=8, lora_alpha=8, target_modules=TARGET_MODULES,
-            task_type="CAUSAL_LM", lora_dropout=0.05,
-            bias="none", inference_mode=False, use_rslora=True,
-            init_lora_weights="gaussian",
-        )
-        model = get_peft_model(model, config)
-        if rank == 0:
-            print(f"[Rank {rank}] LoRA model created successfully")
+    with open(args.train_json, "r") as f:
+        train_data = json.load(f)
+    with open(args.val_json, "r") as f:
+        val_data = json.load(f)
+    train_dataset = PedestrianMatchingDataset(data=train_data, image_processor=processor, tokenizer=tokenizer)
+    val_datasets = PedestrianMatchingDataset_Test(data=val_data, image_processor=processor, tokenizer=tokenizer)
 
     model = DDP(model, device_ids=[rank])
     # device = 'cuda'
@@ -348,19 +286,13 @@ def train_model(rank, world_size, args):
                     "llm_loss": llm_loss.item()
                 })
 
-            # break
-
-
         avg_loss = total_loss / len(train_loader)
 
         acc = evaluate_model(model, val_loaders, processor, tokenizer, device, epoch, args, rank)
 
-        print(acc)
-
-
         if rank == 0:
 
-            # wandb.log({"epoch": epoch + 1, "avg_train_loss": acc})
+
             print(f"[Rank {rank}] Epoch {epoch + 1}/{args.epochs} - Average Loss: {avg_loss:.4f}")
             wandb.log({"epoch": epoch + 1, "avg_train_loss": avg_loss, "acc": acc,})
             # 保存检查点
@@ -381,8 +313,8 @@ def train_model(rank, world_size, args):
 def main():
     parser = argparse.ArgumentParser(description="Train AndesVL with LR optimization (torchrun compatible)")
     parser.add_argument("--dataset", type=str, default="DGM4")
-    parser.add_argument("--train-json", type=str, default="top_data/train_top5_data.json")
-    parser.add_argument("--val-json", type=str, default="top_data/test_top5_data.json")
+    parser.add_argument("--train-json", type=str, default="top_data/train_top2_datas.json")
+    parser.add_argument("--val-json", type=str, default="top_data/test_top2_data.json")
     parser.add_argument("--model-path", type=str, default="./AndesVL-1B-Instruct")
     parser.add_argument("--epochs", type=int, default=13)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -399,7 +331,7 @@ def main():
     parser.add_argument("--save-steps", type=int, default=None, help="Save checkpoint every N steps (default: every epoch)")
     parser.add_argument("--logging-steps", type=int, default=10, help="Log metrics every N steps")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Maximum gradient norm for clipping")
-    parser.add_argument("--project-name", type=str, default="Person_top")
+    parser.add_argument("--project-name", type=str, default="Person_top2")
     parser.add_argument("--output-dir", type=str, default="./Andes_log")
     parser.add_argument("--run-name", type=str, default=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     args = parser.parse_args()
