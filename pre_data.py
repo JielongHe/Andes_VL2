@@ -1,6 +1,6 @@
 import collections
 import os
-from prettytable import PrettyTable
+# from prettytable import PrettyTable
 
 import torch
 import numpy as np
@@ -83,6 +83,7 @@ class Evaluator():
 
         return qfeats.cuda(), gfeats.cuda(), qids, gids, captions, img_paths
 
+
     def eval(self, model, save_path="retrieval_dataset.json", i2t_metric=False):
 
         qfeats, gfeats, qids, gids, captions, img_paths = self._compute_embedding(model)
@@ -93,38 +94,45 @@ class Evaluator():
         similarity = qfeats @ gfeats.t()
         results = []
         num_queries = len(captions)
-
         for i in tqdm(range(num_queries), desc="Building retrieval dataset"):
+
+
+
             qid = qids[i].item()
-            sims = similarity[i]  # (num_gallery,)
-            topk_indices = torch.topk(sims, k=5).indices.tolist()
-            topk_paths = [img_paths[j] for j in topk_indices]
-            topk_ids = [gids[j].item() for j in topk_indices]
 
-            # Case 1: 前5中存在相同ID
-            if qid in topk_ids:
-                real_idx = topk_ids.index(qid)+1
-            else:
-                # Case 2: 没有相同ID，找全局相似度最高且ID相同的图像
-                same_id_mask = (gids == qid)
-                if same_id_mask.any():
-                    same_id_sims = sims[same_id_mask]
-                    global_best_idx = torch.argmax(same_id_sims).item()
-                    global_indices = torch.where(same_id_mask)[0]
-                    global_best_gallery_idx = global_indices[global_best_idx].item()
-                    real_img_path = img_paths[global_best_gallery_idx]
-                    # 随机替换前5中的一个
-                    replace_idx = random.randint(0, 4)
-                    topk_paths[replace_idx] = real_img_path
-                    real_idx = replace_idx+1
+            sims = similarity[i]
+            sorted_values, sorted_indices = torch.sort(sims, descending=True)
+            sort_gids = gids[sorted_indices.cpu()]
+
+            sort_img_paths = [img_paths[indice.item()] for indice in sorted_indices.cpu()]
+
+            for t in range(gids.shape[0]):
+                if t > 1:
+                    break
+
+                topk_paths = sort_img_paths[t:t+2]
+                topk_ids = [j.item() for j in sort_gids[t:t+2]]
+
+                if qid in topk_ids:
+                    real_idx = topk_ids.index(qid) + 1
                 else:
-                    real_idx = 0
+                    same_id_mask = (sort_gids[t:] == qid)
+                    if same_id_mask.any():
+                        same_id_sims = sorted_values[t:][same_id_mask]
+                        global_best_idx = torch.argmax(same_id_sims).item()
+                        global_indices = torch.where(same_id_mask)[0]
+                        global_best_gallery_idx = global_indices[global_best_idx].item()
+                        real_img_path = sort_img_paths[t:][global_best_gallery_idx]
+                        topk_paths[1] = real_img_path
+                        real_idx = 2
+                    else:
+                        break
 
-            results.append({
-                "caption": captions[i],
-                "images": topk_paths,
-                "real_image": real_idx  # 改成索引位置
-            })
+                results.append({
+                    "caption": captions[i],
+                    "images": topk_paths,
+                    "real_image": real_idx  # 改成索引位置
+                })
 
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -163,13 +171,13 @@ if __name__ == '__main__':
 
     train_img_loader, train_txt_loader, test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
 
-    model = build_model(args, num_classes=num_classes)
-    checkpointer = Checkpointer(model)
-    checkpointer.load('./checkpoint/best0.pth')
-    model.to(device)
+    # model = build_model(args, num_classes=num_classes)
+    # checkpointer = Checkpointer(model)
+    # checkpointer.load('./checkpoint/best0.pth')
+    # model.to(device)
 
-    evaluator = Evaluator(train_img_loader, train_txt_loader)
-    top1 = evaluator.eval(model.eval(),save_path='./top_data/train_top5_data.json')
+    # evaluator = Evaluator(train_img_loader, train_txt_loader)
+    # top1 = evaluator.eval(model.eval(),save_path='./top_data/train_top2_datas.json')
 
 
     test_model = build_model(args, num_classes=68126)
@@ -178,7 +186,7 @@ if __name__ == '__main__':
     test_model.to(device)
 
     evaluator1 = Evaluator(test_img_loader, test_txt_loader)
-    top2 = evaluator1.eval(test_model.eval(),save_path='./top_data/test_top5_data.json')
+    top2 = evaluator1.eval(test_model.eval(),save_path='./top_data/test_top2_data.json')
 
 
 
